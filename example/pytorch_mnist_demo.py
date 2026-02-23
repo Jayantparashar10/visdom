@@ -75,18 +75,20 @@ def grad_norm(mdl):
 
 
 def train_epoch(mdl, loader, optimizer, criterion):
+    """Train for one epoch; return average loss and average gradient norm."""
     mdl.train()
     running_loss = 0.0
-    norm = 0.0
+    norm_sum = 0.0
     for images, labels in loader:
         images, labels = images.to(DEVICE), labels.to(DEVICE)
         optimizer.zero_grad()
         loss = criterion(mdl(images), labels)
         loss.backward()
-        norm = grad_norm(mdl)  # capture norm before the weights move
+        norm_sum += grad_norm(mdl)  # accumulate before weights move
         optimizer.step()
         running_loss += loss.item()
-    return running_loss / len(loader), norm
+    n = len(loader)
+    return running_loss / n, norm_sum / n
 
 
 def evaluate(mdl, loader):
@@ -132,7 +134,7 @@ if __name__ == "__main__":
     ), "No connection could be formed quickly, start with: python -m visdom.server"
 
     # show a sample of images before training starts
-    # de-normalise from [-1, 1] back to [0, 1] for display
+    # denormalize from [-1, 1] back to [0, 1] for display
     sample_images, _ = next(iter(train_loader))
     viz.images(
         sample_images[:8] * 0.5 + 0.5,
