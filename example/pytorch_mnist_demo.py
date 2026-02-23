@@ -10,7 +10,7 @@
 # Each metric is logged with an explicit viz.line() call to show
 # what manual instrumentation looks like in practice.
 #
-# Dashboard windows: loss | accuracy | lr | grad_norm | samples
+# Dashboard windows: loss | accuracy | lr (StepLR) | grad_norm | samples
 #
 # Usage:
 #   python -m visdom.server          # start server in one terminal
@@ -27,7 +27,7 @@ import visdom
 # config #
 
 BATCH_SIZE = 64
-EPOCHS = 5
+EPOCHS = 10
 LR = 1e-3
 NUM_WORKERS = 2
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -121,6 +121,7 @@ if __name__ == "__main__":
     model = SimpleCNN().to(DEVICE)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.5)
 
     # visdom #
 
@@ -194,5 +195,7 @@ if __name__ == "__main__":
             f"epoch {epoch}/{EPOCHS}  loss={train_loss:.4f}  acc={accuracy:.2f}%  "
             f"lr={current_lr:.5f}  grad_norm={norm:.4f}"
         )
+
+        scheduler.step()
 
     print("\ndone — open http://localhost:8097 to view the dashboard")
