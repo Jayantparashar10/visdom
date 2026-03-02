@@ -36,7 +36,7 @@ Usage
 ::
 
     import lightning as L
-    from visdom.loggers import VisdomLogger, GradientNormCallback
+    from visdom.lightning_logger import VisdomLogger, GradientNormCallback
 
     logger   = VisdomLogger(env="my_run", port=8097)
     callback = GradientNormCallback(log_every=1, per_layer=False)
@@ -74,18 +74,18 @@ except ImportError:
         from pytorch_lightning import Callback
     except ImportError as exc:
         raise ImportError(
-            "PyTorch Lightning is required for visdom.loggers.\n"
+            "PyTorch Lightning is required for visdom.lightning_logger.\n"
             "Install with:  pip install lightning\n"
             "  or (older):  pip install pytorch-lightning"
         ) from exc
 
 import visdom
-from visdom.loggers.base import compute_grad_norm, compute_layer_grad_norms
-
+from visdom.grad_norm import compute_grad_norm, compute_layer_grad_norms
 
 # ---------------------------------------------------------------------------
 # VisdomLogger
 # ---------------------------------------------------------------------------
+
 
 class VisdomLogger(_LightningLogger):
     """
@@ -236,7 +236,7 @@ class VisdomLogger(_LightningLogger):
 
             # Train metrics → blue  |  val metrics → orange (easy to scan)
             color = (
-                np.array([[31, 119, 180]])   # matplotlib blue
+                np.array([[31, 119, 180]])  # matplotlib blue
                 if "val" not in key
                 else np.array([[255, 127, 14]])  # matplotlib orange
             )
@@ -316,6 +316,7 @@ class VisdomLogger(_LightningLogger):
 # GradientNormCallback
 # ---------------------------------------------------------------------------
 
+
 class GradientNormCallback(Callback):
     """
     Automatically log gradient norms to Visdom via PyTorch tensor hooks.
@@ -373,7 +374,7 @@ class GradientNormCallback(Callback):
         self.per_layer = per_layer
         self.profile_hooks = profile_hooks
 
-        self._handles: List = []           # registered hook handles
+        self._handles: List = []  # registered hook handles
         self._hook_times_ms: List[float] = []  # profiling accumulator
 
     # ------------------------------------------------------------------
@@ -418,7 +419,7 @@ class GradientNormCallback(Callback):
             return
 
         if not hasattr(pl_module, "log"):
-            raise ValueError(
+            raise TypeError(
                 "GradientNormCallback requires a LightningModule with a "
                 ".log() method."
             )
@@ -445,18 +446,29 @@ class GradientNormCallback(Callback):
                     on_epoch=False,
                 )
 
-        if self.profile_hooks and self._hook_times_ms:
-            mean_ms = sum(self._hook_times_ms) / len(self._hook_times_ms)
-            pl_module.log(
-                "grad_hook_ms",
-                mean_ms,
-                on_step=True,
-                on_epoch=False,
-            )
+        if self.profile_hooks:
+            if self._hook_times_ms:
+                mean_ms = sum(self._hook_times_ms) / len(self._hook_times_ms)
+                pl_module.log(
+                    "grad_hook_ms",
+                    mean_ms,
+                    on_step=True,
+                    on_epoch=False,
+                )
+            # Always clear to prevent unbounded memory growth between log steps
             self._hook_times_ms.clear()
 
-    def on_fit_end(self, trainer, pl_module) -> None:
-        """Remove all registered hooks when training completes."""
+    def _remove_hooks(self) -> None:
+        """Detach all registered tensor hooks."""
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
+
+    def on_fit_end(self, trainer, pl_module) -> None:
+        """Remove all registered hooks when training completes normally."""
+        self._remove_hooks()
+
+    def teardown(self, trainer, pl_module, stage: str) -> None:
+        """Ensure hooks are removed even if training exits due to an error."""
+        if stage == "fit":
+            self._remove_hooks()

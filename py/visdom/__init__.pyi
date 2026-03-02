@@ -210,3 +210,13 @@ class Visdom:
         env: _OptStr = ...,
         opts: _OptOps = ...,
     ) -> _SendReturn: ...
+    def log_gradient_norm(
+        self,
+        model: Any,
+        step: int,
+        win: str = ...,
+        env: _OptStr = ...,
+        opts: _OptOps = ...,
+        norm_type: float = ...,
+        per_layer: bool = ...,
+    ) -> float: ...
