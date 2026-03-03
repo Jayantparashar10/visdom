@@ -2715,12 +2715,6 @@ class Visdom(object):
 # optional: users who don't have Lightning installed can still import visdom)
 # ---------------------------------------------------------------------------
 
-try:
-    from visdom.grad_norm import compute_grad_norm, compute_layer_grad_norms
-except ImportError:
-    pass  # torch not installed; log_gradient_norm will raise at call-time
-
-
 def __getattr__(name):
     if name in ("VisdomLogger", "GradientNormCallback"):
         from visdom.lightning_logger import VisdomLogger, GradientNormCallback

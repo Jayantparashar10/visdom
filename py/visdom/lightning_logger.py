@@ -69,7 +69,7 @@ try:
 except ImportError:
     try:
         import pytorch_lightning as pl
-        from pytorch_lightning.loggers import LightningLoggerBase as _LightningLogger
+        from pytorch_lightning.loggers import Logger as _LightningLogger
         from pytorch_lightning.utilities import rank_zero_only
         from pytorch_lightning import Callback
     except ImportError as exc:
@@ -385,6 +385,9 @@ class GradientNormCallback(Callback):
         """Register tensor hooks on every trainable parameter."""
         if stage != "fit":
             return
+        # Defensive cleanup: remove any previously registered hooks in case
+        # setup() is called more than once on the same callback instance.
+        self._remove_hooks()
         for _name, p in pl_module.named_parameters():
             if p.requires_grad:
                 handle = p.register_hook(self._make_hook())
@@ -415,39 +418,41 @@ class GradientNormCallback(Callback):
 
     def on_before_optimizer_step(self, trainer, pl_module, optimizer) -> None:
         """Compute and log gradient norms before weights are updated."""
-        if trainer.global_step % self.log_every != 0:
-            return
+        # Always drain the profiling buffer in the finally block so the list
+        # never exceeds N_params entries regardless of log_every throttling.
+        try:
+            if trainer.global_step % self.log_every != 0:
+                return
 
-        if not hasattr(pl_module, "log"):
-            raise TypeError(
-                "GradientNormCallback requires a LightningModule with a "
-                ".log() method."
-            )
-
-        total_norm = compute_grad_norm(pl_module.parameters(), self.norm_type)
-        pl_module.log(
-            "grad_norm",
-            total_norm,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-        )
-
-        if self.per_layer:
-            # Use pl_module directly — works for any LightningModule regardless
-            # of whether the model is wrapped in a .model attribute or not.
-            for name, norm_val in compute_layer_grad_norms(
-                pl_module, self.norm_type
-            ).items():
-                pl_module.log(
-                    f"grad_norm/{name.replace('.', '/')}",
-                    norm_val,
-                    on_step=True,
-                    on_epoch=False,
+            if not hasattr(pl_module, "log"):
+                raise TypeError(
+                    "GradientNormCallback requires a LightningModule with a "
+                    ".log() method."
                 )
 
-        if self.profile_hooks:
-            if self._hook_times_ms:
+            total_norm = compute_grad_norm(pl_module.parameters(), self.norm_type)
+            pl_module.log(
+                "grad_norm",
+                total_norm,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+            )
+
+            if self.per_layer:
+                # Use pl_module directly — works for any LightningModule regardless
+                # of whether the model is wrapped in a .model attribute or not.
+                for name, norm_val in compute_layer_grad_norms(
+                    pl_module, self.norm_type
+                ).items():
+                    pl_module.log(
+                        f"grad_norm/{name.replace('.', '/')}",
+                        norm_val,
+                        on_step=True,
+                        on_epoch=False,
+                    )
+
+            if self.profile_hooks and self._hook_times_ms:
                 mean_ms = sum(self._hook_times_ms) / len(self._hook_times_ms)
                 pl_module.log(
                     "grad_hook_ms",
@@ -455,7 +460,9 @@ class GradientNormCallback(Callback):
                     on_step=True,
                     on_epoch=False,
                 )
-            # Always clear to prevent unbounded memory growth between log steps
+        finally:
+            # Clear on every step (logging or skipped) to bound memory usage
+            # to at most N_params entries between optimizer steps.
             self._hook_times_ms.clear()
 
     def _remove_hooks(self) -> None:
