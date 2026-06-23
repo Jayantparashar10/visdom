@@ -442,7 +442,36 @@ try:
     torch_types.append(torch.Tensor)
     torch_types.append(torch.nn.Parameter)
 except (ImportError, AttributeError):
-    pass
+    torch = None
+
+
+def _get_visdom_device():
+    """Return the best available torch device for tensor ops, or None.
+
+    Priority: CUDA (NVIDIA/ROCm) > MPS (Apple Silicon) > XPU (Intel) > None.
+    Returns None when torch is not installed.
+    """
+    if torch is None:
+        return None
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu")
+    return None
+
+
+def _to_device(arr, device):
+    """Move a numpy array to a torch tensor on device.
+
+    MPS does not support float64; casts to float32 on MPS only.
+    Integer dtypes are left unchanged on all devices.
+    """
+    t = torch.from_numpy(np.ascontiguousarray(arr))
+    if device.type == "mps" and t.dtype == torch.float64:
+        t = t.float()
+    return t.to(device)
 
 
 def _to_numpy(a):
@@ -463,6 +492,8 @@ def _to_numpy(a):
             # tensors do not have a 'detach' method. Will be removed.
             if hasattr(a, "detach"):
                 a = a.detach()
+            if a.is_cuda and not a.is_contiguous():
+                a = a.contiguous()
             return a.cpu().numpy()
     return a
 
@@ -1616,7 +1647,17 @@ class Visdom(object):
                 tensor = np.repeat(tensor, 3, 0)
             return self.image(tensor, win, env, opts)
         if tensor.ndim == 4 and tensor.shape[1] == 1:  # single-channel images
-            tensor = np.repeat(tensor, 3, 1)
+            _device = _get_visdom_device()
+            if _device is not None:
+                tensor = (
+                    _to_device(tensor, _device)
+                    .expand(-1, 3, -1, -1)
+                    .contiguous()
+                    .cpu()
+                    .numpy()
+                )
+            else:
+                tensor = np.repeat(tensor, 3, 1)
 
         # make 4D tensor of images into a grid
         nmaps = tensor.shape[0]
@@ -1671,7 +1712,12 @@ class Visdom(object):
             audiofile = os.path.join(
                 tempfile.gettempdir(), "%s.wav" % next(tempfile._get_candidate_names())
             )
-            tensor = np.int16(tensor / np.max(np.abs(tensor)) * 32767)
+            _device = _get_visdom_device()
+            if _device is not None:
+                t = _to_device(tensor, _device)
+                tensor = t.div_(t.abs().max()).mul_(32767).short().cpu().numpy()
+            else:
+                tensor = np.int16(tensor / np.max(np.abs(tensor)) * 32767)
             scipy.io.wavfile.write(audiofile, opts.get("sample_frequency"), tensor)
 
         extension = audiofile.split(".")[-1].lower()
@@ -1706,7 +1752,18 @@ class Visdom(object):
         # Float tensors are assumed to have a domain of [0, 1], for
         # backward-compatibility with OpenCV.
         if np.issubdtype(tensor.dtype, np.floating):
-            tensor = 255 * tensor
+            _device = _get_visdom_device()
+            if _device is not None:
+                tensor = (
+                    _to_device(tensor, _device)
+                    .mul(255)
+                    .clamp(0, 255)
+                    .byte()
+                    .cpu()
+                    .numpy()
+                )
+            else:
+                tensor = 255 * tensor
         tensor = tensor.astype(np.uint8).clip(0, 255)
 
         # Use BGR for backward-compatibility with OpenCV
@@ -1947,8 +2004,20 @@ class Visdom(object):
         )
         lc = opts.get("linecolor")
 
-        for k in labels:
-            ind = np.equal(Y, k)
+        _ind_matrix = None
+        _device = _get_visdom_device()
+        if _device is not None:
+            try:
+                _Y_t = _to_device(Y, _device)
+                _labels_t = _to_device(labels, _device)
+                _ind_matrix = (
+                    _Y_t.unsqueeze(0) == _labels_t.unsqueeze(1)
+                ).cpu().numpy()
+            except Exception:
+                _ind_matrix = None
+
+        for _i, k in enumerate(labels):
+            ind = _ind_matrix[_i] if _ind_matrix is not None else np.equal(Y, k)
             if ind.any():
                 if "legend" in opts:
                     trace_name = opts.get("legend")[k - 1]
@@ -2135,10 +2204,32 @@ class Visdom(object):
             X = np.linspace(0, 1, Y.shape[0])
 
         if Y.ndim == 2 and X.ndim == 1:
-            X = np.tile(X, (Y.shape[1], 1)).transpose()
+            _device = _get_visdom_device()
+            if _device is not None:
+                X = (
+                    _to_device(X, _device)
+                    .unsqueeze(0)
+                    .expand(Y.shape[1], -1)
+                    .T.contiguous()
+                    .cpu()
+                    .numpy()
+                )
+            else:
+                X = np.tile(X, (Y.shape[1], 1)).transpose()
 
         if Z is not None and Y.ndim == 2 and Z.ndim == 1:
-            Z = np.tile(Z, (Y.shape[1], 1)).transpose()
+            _device = _get_visdom_device()
+            if _device is not None:
+                Z = (
+                    _to_device(Z, _device)
+                    .unsqueeze(0)
+                    .expand(Y.shape[1], -1)
+                    .T.contiguous()
+                    .cpu()
+                    .numpy()
+                )
+            else:
+                Z = np.tile(Z, (Y.shape[1], 1)).transpose()
 
         assert X.shape == Y.shape, "X and Y should be the same shape"
         if Z is not None:
@@ -2381,8 +2472,17 @@ class Visdom(object):
         _title2str(opts)
         _assert_opts(opts)
 
-        minx, maxx = X.min(), X.max()
-        bins = np.histogram(X, bins=opts["numbins"], range=(minx, maxx))[0]
+        _device = _get_visdom_device()
+        if _device is not None:
+            X_t = _to_device(X, _device)
+            _xmin_t, _xmax_t = X_t.aminmax()
+            minx, maxx = _xmin_t.item(), _xmax_t.item()
+            bins = torch.histc(
+                X_t, bins=opts["numbins"], min=minx, max=maxx
+            ).cpu().numpy()
+        else:
+            minx, maxx = X.min(), X.max()
+            bins = np.histogram(X, bins=opts["numbins"], range=(minx, maxx))[0]
         linrange = np.linspace(minx, maxx, opts["numbins"])
 
         return self.bar(X=bins, Y=linrange, opts=opts, win=win, env=env)
@@ -2453,8 +2553,19 @@ class Visdom(object):
         assert X.ndim == 2, "X should be two-dimensional"
 
         opts = {} if opts is None else opts
-        opts["xmin"] = float(opts.get("xmin", X.min()))
-        opts["xmax"] = float(opts.get("xmax", X.max()))
+        if "xmin" not in opts or "xmax" not in opts:
+            _device = _get_visdom_device()
+            if _device is not None:
+                _X_t = _to_device(X, _device)
+                _xmin_t, _xmax_t = _X_t.aminmax()
+                opts["xmin"] = float(opts.get("xmin", _xmin_t.item()))
+                opts["xmax"] = float(opts.get("xmax", _xmax_t.item()))
+            else:
+                opts["xmin"] = float(opts.get("xmin", X.min()))
+                opts["xmax"] = float(opts.get("xmax", X.max()))
+        else:
+            opts["xmin"] = float(opts["xmin"])
+            opts["xmax"] = float(opts["xmax"])
         opts["colormap"] = opts.get("colormap", "Viridis")
         _title2str(opts)
         _assert_opts(opts)
@@ -2553,7 +2664,17 @@ class Visdom(object):
                 and opts["normalize"] > 0
                 and np.isfinite(opts["normalize"])
             ), "opts.normalize should be a finite positive number"
-            magnitude = np.sqrt(np.add(np.multiply(X, X), np.multiply(Y, Y)))
+            _device = _get_visdom_device()
+            if _device is not None:
+                _X_t = _to_device(X, _device)
+                _Y_t = _to_device(Y, _device)
+                magnitude = torch.sqrt(
+                    _X_t * _X_t + _Y_t * _Y_t
+                ).cpu().numpy()
+            else:
+                magnitude = np.sqrt(
+                    np.add(np.multiply(X, X), np.multiply(Y, Y))
+                )
             finite_mask = np.isfinite(magnitude)
 
             if not np.any(finite_mask):
@@ -2651,9 +2772,8 @@ class Visdom(object):
         if Y.shape[1] < X.shape[1]:
             Y = np.tile(Y, (1, X.shape[1]))
 
-        Z = np.zeros((Y.shape))  # Zeros
-        with np.errstate(divide="ignore", invalid="ignore"):
-            N = Z / Z  # NaNs
+        Z = np.zeros(Y.shape)
+        N = np.full(Y.shape, np.nan)
         X = np.column_stack((Z, X, N)).reshape((X.shape[0] * 3, X.shape[1]))
         Y = np.column_stack((Y, Y, N)).reshape((Y.shape[0] * 3, Y.shape[1]))
 
